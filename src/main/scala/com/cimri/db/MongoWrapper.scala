@@ -1,74 +1,66 @@
 package com.cimri.db
 
-import cats.effect.{Async, IO, Resource}
+import cats.effect.{IO, Resource}
 import org.mongodb.scala._
 import org.mongodb.scala.bson.BsonDateTime
 import org.mongodb.scala.model.Filters._
-import org.mongodb.scala.result.{InsertManyResult, InsertOneResult}
-
+import org.mongodb.scala.model.{IndexOptions, Indexes, ReplaceOneModel, ReplaceOptions}
+import scala.concurrent.Future
 import java.util.Date
-import scala.language.higherKinds
 
 object MongoWrapper {
+  // The by-name Future is created only when the IO runs, and failure is propagated.
+  private[cimri] def await[A](future: => Future[A]): IO[A] = IO.fromFuture(IO(future))
 
-  /**
-   * Creates a resource for managing MongoDB connection lifecycle.
-   * @param uri the MongoDB URI
-   * @param db the name of the database
-   * @param collectionName the name of the collection to be used
-   * @return a resource that provides a MongoWrapper instance
-   */
   def apply(uri: String, db: String, collectionName: String): Resource[IO, MongoWrapper] =
-    Resource.make(IO(new MongoWrapper {
-      override def mongoClient: MongoClient = MongoClient(uri)
-
-      override def cimriDB: MongoDatabase = mongoClient.getDatabase(db)
-
-      override def collection: MongoCollection[Document] = cimriDB.getCollection(collectionName)
-    }))(src => IO(src.closeConnection()))
+    Resource.make(IO(MongoClient(uri)))(client => IO(client.close())).map { client =>
+      new MongoWrapper {
+        override val mongoClient: MongoClient = client
+        override val cimriDB: MongoDatabase = client.getDatabase(db)
+        override val collection: MongoCollection[Document] = cimriDB.getCollection(collectionName)
+      }
+    }
 }
 
-/**
- * Class defining the interface for MongoDB operations.
- */
 abstract class MongoWrapper {
-
   def mongoClient: MongoClient
   def cimriDB: MongoDatabase
   def collection: MongoCollection[Document]
-
   def closeConnection(): Unit = mongoClient.close()
 
-  private def observer[T]: Observer[T] = new Observer[T] {
-    override def onNext(result: T): Unit = println("Done")
+  def insertOneIntoMongo(document: Document): IO[Unit] =
+    MongoWrapper.await(collection.insertOne(document).toFuture()).void
 
-    override def onError(e: Throwable): Unit = println(s"Failed. Reason: ${e.getMessage}")
+  def insertManyIntoMongo(documents: Seq[_ <: Document]): IO[Unit] =
+    if (documents.isEmpty) IO.unit
+    else MongoWrapper.await(collection.insertMany(documents).toFuture()).void
 
-    override def onComplete(): Unit = println("Completed")
-  }
+  /** A repeated feed version replaces that version instead of duplicating history.
+    * A feed is not an atomic transaction; after a partial failure replay the file.
+    */
+  def ensureHistoryIndex: IO[Unit] = MongoWrapper.await(collection.createIndex(
+    Indexes.ascending("id", "version"), IndexOptions().unique(true)).toFuture()).void
 
-  // Commands
-  import cats.syntax.applicative._
+  def upsertHistory(documents: Seq[Document]): IO[Unit] =
+    if (documents.isEmpty) IO.unit
+    else IO.defer {
+      require(documents.forall(d => d.containsKey("id") && d.containsKey("version")),
+        "History documents require id and version")
+      val writes = documents.map { d =>
+        ReplaceOneModel[Document](and(equal("id", d.getString("id")), equal("version", d.get("version").get)),
+          d, ReplaceOptions().upsert(true))
+      }
+      MongoWrapper.await(collection.bulkWrite(writes).toFuture()).void
+    }
 
-  def insertOneIntoMongo(document: Document): IO[Unit] = collection
-.insertOne(document).subscribe(observer[InsertOneResult]).pure[IO]
-
-  def insertManyIntoMongo(documents: Seq[_ <: Document]): IO[Unit] = collection
-.insertMany(documents).subscribe(observer[InsertManyResult]).pure[IO]
-
-  // Queries
-
-  import scala.concurrent.ExecutionContext
-  implicit val ec: ExecutionContext = ExecutionContext.global
-
+  // Stable latest-version result instead of MongoDB's arbitrary first match.
   def queryById(id: String): IO[Option[Document]] =
-    Async[IO] fromFuture collection.find(equal("id", id)).first().headOption().pure[IO]
+    MongoWrapper.await(collection.find(equal("id", id))
+      .sort(org.mongodb.scala.model.Sorts.descending("version")).first().headOption())
 
-  def queryByIdAndDate(id: String, startDate: Date, endDate: Date): IO[Seq[Document]] =
-    Async[IO] fromFuture collection.find(and(
-      equal("id", id),
-      gte("version", BsonDateTime(startDate)),
-      lte("version", BsonDateTime(endDate))
-    )).toFuture().pure[IO]
-
+  // start inclusive, end exclusive (the API supplies midnight after the last day).
+  def queryByIdAndDate(id: String, startDate: Date, endExclusive: Date): IO[Seq[Document]] =
+    MongoWrapper.await(collection.find(and(equal("id", id),
+      gte("version", BsonDateTime(startDate)), lt("version", BsonDateTime(endExclusive))))
+      .sort(org.mongodb.scala.model.Sorts.ascending("version")).toFuture())
 }

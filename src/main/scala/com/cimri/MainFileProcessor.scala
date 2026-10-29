@@ -1,7 +1,10 @@
 package com.cimri
 
 import cats.effect.{ExitCode, IO, IOApp}
-import com.cimri.fileprocessor.FileHandler.{getCsvFile, getJsonFile}
+import com.cimri.fileprocessor.FileHandler.{foreachCsvBatch, getJsonFile}
+import cats.syntax.all._
+import java.time.ZoneOffset
+import java.nio.file.Paths
 import com.cimri.db.MongoWrapper
 import com.cimri.model.Feed
 import org.mongodb.scala.bson.BsonDateTime
@@ -23,7 +26,7 @@ object MainFileProcessor extends IOApp {
    * @return A map of date to a list of all respecting feed file entries
    */
   def splitFeedDayByDay(listOfFeed: List[Feed]): Map[String, List[Feed]] = listOfFeed
-    .groupBy(feed => new SimpleDateFormat("yyyy-MM-dd").format(feed.version))
+    .groupBy(feed => feed.version.toInstant.atZone(ZoneOffset.UTC).toLocalDate.toString)
 
 
   /**
@@ -35,13 +38,15 @@ object MainFileProcessor extends IOApp {
   def insertOneFile(mongo: MongoWrapper, path: String, feed: Feed): IO[Unit] = {
     val version = "version" -> BsonDateTime(feed.version)
 
-    for {
-      file <- getCsvFile(s"$path/${feed.name}")
-      documentList = file.map { record =>
-        Document(record.map { case (key, value) => key -> value }) + version
+    val root = Paths.get(path).toAbsolutePath.normalize()
+    val file = root.resolve(feed.name).normalize()
+    IO.raiseWhen(!file.startsWith(root))(new IllegalArgumentException("Feed path escapes input directory")) *>
+      foreachCsvBatch(file.toString) { rows =>
+        IO {
+          require(rows.forall(_.get("id").exists(_.trim.nonEmpty)), "Every row needs a non-empty id")
+          rows.map(record => Document(record.map { case (key, value) => key -> value }) + version)
+        }.flatMap(mongo.upsertHistory)
       }
-      _ <- mongo.insertManyIntoMongo(documentList)
-    } yield ()
   }
 
   /**
@@ -53,27 +58,25 @@ object MainFileProcessor extends IOApp {
    */
   def processBaseAndInsertIntoMongoByDay(path: String, listOfFeed: List[Feed])(mongo: MongoWrapper): IO[List[Unit]] = {
 
-    val base = listOfFeed.head
-    val deltas = listOfFeed.tail
-
-    if (base.feedType != "base" || !deltas.forall(_.feedType == "delta"))
-      throw new Exception("Multiple or none base file")
-
-    import cats.syntax.parallel._
-    listOfFeed
-      .parTraverse(feed => insertOneFile(mongo, path, feed))
+    IO.defer {
+      val ordered = listOfFeed.sortBy(_.version.getTime)
+      require(ordered.nonEmpty && ordered.head.feedType == "base" &&
+        ordered.tail.forall(_.feedType == "delta"), "Expected one base followed by deltas")
+      ordered.traverse(feed => insertOneFile(mongo, path, feed))
+    }
   }
 
   override def run(args: List[String]): IO[ExitCode] = {
 
-    val listOfFeed = getJsonFile("/home/aluscent/IdeaProjects/Cimri-Scala-Challenge/cimri-challenge/feeds.json")
-
-    val dirPath = "/home/aluscent/IdeaProjects/Cimri-Scala-Challenge/cimri-challenge"
-
-    for {
-      list <- listOfFeed
-      _ <- MongoWrapper("mongodb://localhost:27017/cimri", "cimri", "price_changes").use(processBaseAndInsertIntoMongoByDay(dirPath, list))
-      _ <- IO.sleep(1 seconds)
-    } yield ExitCode.Success
+    args match {
+      case manifest :: directory :: Nil =>
+        for {
+          list <- getJsonFile(manifest)
+          _ <- MongoWrapper(sys.env.getOrElse("MONGO_URI", "mongodb://localhost:27017"), "cimri", "price_changes").use { mongo =>
+            mongo.ensureHistoryIndex *> processBaseAndInsertIntoMongoByDay(directory, list)(mongo)
+          }
+        } yield ExitCode.Success
+      case _ => IO.println("Usage: MainFileProcessor <feeds.json> <feed-directory>").as(ExitCode.Error)
+    }
   }
 }

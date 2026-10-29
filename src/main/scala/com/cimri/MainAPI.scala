@@ -10,7 +10,7 @@ object MainAPI extends IOApp {
    * Main entry point for the application API part.
    */
   override def run(args: List[String]): IO[ExitCode] =
-    MongoWrapper("mongodb://localhost:27017/cimri", "cimri", "price_changes")
+    MongoWrapper(sys.env.getOrElse("MONGO_URI", "mongodb://localhost:27017"), "cimri", "price_changes")
       .use(mongo => Server(12345, Endpoints.endpoints(mongo)).getOrCreate) >>
       IO(ExitCode.Success)
 }

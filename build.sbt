@@ -21,6 +21,7 @@ lazy val root = (project in file("."))
 
       "io.spray" %% "spray-json" % "1.3.6",
       "io.circe" %% "circe-generic" % "0.14.7",
+      "io.circe" %% "circe-parser" % "0.14.7",
 
       "com.github.tototoshi" %% "scala-csv" % "1.3.10",
 
