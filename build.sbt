@@ -1,6 +1,6 @@
 ThisBuild / version := "0.1.0-SNAPSHOT"
 
-ThisBuild / scalaVersion := "2.12.18"
+ThisBuild / scalaVersion := "2.12.20"
 
 val akkaVersion = "2.8.5"
 val akkaHttpVersion = "10.5.3"
@@ -26,8 +26,8 @@ lazy val root = (project in file("."))
       "com.github.tototoshi" %% "scala-csv" % "1.3.10",
 
       "org.scalatest" %% "scalatest" % "3.2.18" % Test,
-      "com.dimafeng" %% "testcontainers-scala-scalatest" % "0.41.3" % Test,
-      "com.dimafeng" %% "testcontainers-scala-mongodb" % "0.41.3" % Test,
+      "com.dimafeng" %% "testcontainers-scala-scalatest" % "0.44.1" % Test,
+      "com.dimafeng" %% "testcontainers-scala-mongodb" % "0.44.1" % Test,
       "org.mockito" %% "mockito-scala" % "1.17.31" % Test,
       "org.typelevel" %% "cats-effect-testing-scalatest" % "1.5.0" % Test
     )
